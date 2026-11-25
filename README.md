@@ -1,12 +1,13 @@
 # Antigravity ACP — thin interactive client for Hermes Agent
 
-A Hermes Agent plugin that lets you chat with **Google Antigravity** through its
-official `agy acp` agent, on **your own Google sign-in**, as a plain interactive
+A Hermes Agent plugin that adds a native **Desktop page** for chatting with
+**Google Antigravity** through its official `agy acp` agent, on **your own
+Google sign-in**, as a plain interactive
 [Agent Client Protocol](https://agentclientprotocol.com) client.
 
 ```text
-you ──type a prompt──> hermes antigravity chat ──ACP/stdio──> agy acp (unmodified official binary)
-                                                              └─ owns auth, history, tools, quota
+you ──type in the Desktop page──> backend plugin_api.py ──ACP/stdio──> agy acp (unmodified official binary)
+        (Hermes Desktop)              (on your server)                  └─ owns auth, history, tools, quota
 ```
 
 ## What this plugin is — and what it deliberately is not
@@ -14,8 +15,8 @@ you ──type a prompt──> hermes antigravity chat ──ACP/stdio──> ag
 Google's Antigravity terms distinguish two ways of using a consumer
 (`oauth-personal`) sign-in:
 
-- **Interactive ACP clients are fine**: an editor or client launches the
-  unmodified `agy acp` binary and the user drives it interactively.
+- **Interactive ACP clients are fine**: a client launches the unmodified
+  `agy acp` binary and the user drives it interactively.
 - **Agent harnesses are not**: a framework that wraps the binary inside its own
   agent loop, injecting system prompts, foreign conversation history or foreign
   tool schemas, or driving it autonomously. See Google's own clarification in
@@ -26,76 +27,111 @@ This plugin is built to stay on the right side of that line:
 | It does | It never does |
 |---|---|
 | Spawn the **unmodified** official binary | Patch, wrap or re-implement the agent |
-| Send only prompts **you type yourself** | Inject Hermes system prompts, personas or history |
+| Send only prompts **you type yourself** in the Desktop page | Inject Hermes system prompts, personas or history |
 | Let `agy` own history, tools, planning, quota | Serialize Hermes tool schemas into prompts |
 | Forward permission requests for **you** to decide | Auto-answer approvals or fake permission modes |
 | Use the native OAuth flow, tokens stay in `agy`'s own storage | Read, proxy or refresh access/refresh tokens |
 | Identify itself honestly (`hermes-antigravity-acp`) | Impersonate another client |
-| Run when you start it and stop when you leave | Cron, subagents, background automation, account rotation |
+| Run when you open the page and stop when you close it | Cron, subagents, background automation, account rotation |
 
-Consequently the plugin registers **no model provider** (Hermes must not use
-Antigravity as a model backend on a consumer sign-in), **no tools** (Hermes must
-not auto-invoke it) and **no hooks**. The only surface is the
-`hermes antigravity` command, driven by you.
+Consequently the plugin registers **no model provider**, **no tools**, **no
+hooks** and **no CLI automation surface** — a test enforces this invariant. If
+you want Hermes' own agent loop backed by Google models, use a Gemini API key
+or Vertex AI instead; that is the supported path for framework-style use.
 
-If you want Hermes' own agent loop backed by Google models, use a Gemini API key
-or Vertex AI instead — that is the supported path for framework-style use.
+## Architecture
 
-## Requirements
-
-- Hermes Agent ≥ 0.21.4
-- Python ≥ 3.11
-- The official Antigravity CLI (`agy` or `antigravity` on `PATH`), or set
-  `ANTIGRAVITY_ACP_COMMAND` to the executable
-- A Google account with Antigravity access, signed in through the native flow
-  (or a Gemini Enterprise / API-key / Vertex auth method the agent offers)
+- **`dashboard/plugin_api.py`** — FastAPI router mounted by the Hermes web
+  server at `/api/plugins/antigravity-acp/`. Manages `agy acp` subprocesses on
+  the machine running the backend (your VPS), one process per chat session,
+  with a per-session seq-numbered event log. Streaming reaches the UI through
+  long-polling (`GET /sessions/{h}/events?since=&wait=`), which works through
+  every connection mode Hermes supports.
+- **`dashboard/agy_backend.py`** — dependency-free ACP client (ndjson JSON-RPC
+  over stdio), profile isolation, environment scrubbing.
+- **`desktop/plugin.js`** — native Desktop disk plugin (plain ESM, no build):
+  sidebar entry + `/antigravity` page with the chat UI, permission cards,
+  cancel/close controls.
 
 ## Install
 
-```sh
-hermes plugins install NightOnee/hermes-plugin-antigravity-acp
-```
+1. Install the backend plugin on the machine running your Hermes backend:
 
-## Use
+   ```sh
+   hermes plugins install NightOnee/hermes-plugin-antigravity-acp
+   ```
 
-```sh
-hermes antigravity login     # native Google sign-in (browser / printed URL)
-hermes antigravity status    # binary + profile status
-hermes antigravity chat      # interactive session — every prompt is typed by you
-hermes antigravity logout    # drop the stored sign-in for this profile
-```
+2. Enable the Desktop page. Hermes Desktop discovers
+   `plugins/antigravity-acp/desktop/plugin.js` in the installed package and
+   copies it into its local `desktop-plugins/` directory — open
+   **Capabilities → Plugins** and use **Rescan**, then enable it. If discovery
+   does not pick it up, copy it manually on the machine running Desktop:
 
-Inside chat:
+   ```sh
+   cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/antigravity-acp/plugin.js"
+   ```
 
-```text
-hermes-agy> /help      commands (/new /cancel /mode <id> /quit)
-hermes-agy> explain this repo's auth flow        <- sent verbatim to Antigravity
-```
+   (`$HERMES_HOME` is `~/.hermes` by default.)
 
-Attachments, multiple sessions and automation are out of scope on purpose:
-an interactive terminal session is the compliance boundary.
+3. Make sure the **server** (where the backend runs) has the official
+   Antigravity CLI installed (`agy` or `antigravity` on `PATH`, or set
+   `ANTIGRAVITY_ACP_COMMAND`).
+
+4. Sign in once with your Google account. The plugin's profile lives on the
+   server under `~/.hermes/plugins-data/antigravity-acp/gemini-home`. On a
+   headless server the native OAuth flow prints a sign-in URL; completing it is
+   the one setup step that may need a shell on the server (or ask one of your
+   CLI-capable agents to run it). **This auth flow is the least-tested part —
+   see the caveats below.**
+
+5. Open **Antigravity** in the Desktop sidebar and chat.
 
 ## Isolation model
 
 - Per-install profile under `~/.hermes/plugins-data/antigravity-acp/gemini-home`
-  (override with `ANTIGRAVITY_ACP_HOME`), permissions `0700`.
+  on the server (override with `ANTIGRAVITY_ACP_HOME`), permissions `0700`.
 - The agent process is spawned with ambient Google/Gemini credential variables
   stripped (`GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`,
   `GOOGLE_CLOUD_*`, …): the instance can only use the account you signed in
   with for this profile, never whatever happens to be in the environment.
 - `AGY_CLI_DISABLE_AUTO_UPDATE=1` and `AGY_ACP_FORCE_FILE_STORAGE=1` keep the
   binary and credential layout stable and instance-scoped.
-- Sessions are scoped to the working directory you start `chat` in.
+- Sessions live in the backend process memory: a gateway/plugin-host restart
+  ends live chats (the agent's own history is preserved by `agy`; resume is on
+  the roadmap).
+
+## Status and caveats
+
+**Tested** (8 tests, in-repo fake ACP server): environment scrubbing, spawn
+argv, session lifecycle, streaming into the event log, long-poll draining,
+permission allow/dismiss round-trips, session manager, and the
+no-tools/no-hooks/no-CLI compliance invariant.
+
+**Not yet verified against reality** — expect friction here on first use:
+
+- The real `agy` binary's exact behaviors (auth URL printing, mode names,
+  session update shapes) are implemented from the ACP spec and T3 Code's
+  implementation, not from a live run.
+- Headless OAuth on a VPS: the loopback redirect can't complete on a server
+  without a browser. T3 solves this with a paste-the-callback flow and
+  `agy acp --login`; this plugin does not implement that yet — for now, sign in
+  on the server once by whatever method works (CLI login, or run `agy` login
+  interactively there).
+- Hermes plugin-host process semantics: if your deployment runs plugin code in
+  an isolated host process, session state lives there — fine while the host
+  stays up, gone when it restarts.
+- Attachments, terminals and multi-session UI are future work.
 
 ## Development
 
 ```sh
-python -m venv .venv && .venv/bin/pip install -e . pytest
+python -m venv .venv && .venv/bin/pip install pytest agent-client-protocol
 .venv/bin/python -m pytest
 ```
 
-Tests run against `tests/fake_agent.py`, a small in-repo ACP server — no real
-Antigravity binary or Google account needed.
+Tests run against `tests/fake_agent.py`, a small in-repo ACP server built on
+the official `agent-client-protocol` Python SDK (test-only dependency) — no
+real Antigravity binary or Google account needed.
 
 ## Prior art
 

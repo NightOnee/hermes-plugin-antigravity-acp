@@ -1,17 +1,17 @@
-"""Tests run against the fake ACP agent in tests/fake_agent.py."""
+"""Backend tests run against the fake ACP agent in tests/fake_agent.py."""
 
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
 import pytest
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-from client import HermesAcpClient, spawn_session  # noqa: E402
-from process import build_env, acp_argv, gemini_home  # noqa: E402
+sys.path.insert(0, str(PLUGIN_ROOT / "dashboard"))
+
+import agy_backend  # noqa: E402
 
 FAKE_AGENT = str(PLUGIN_ROOT / "tests" / "fake_agent.py")
 
@@ -31,99 +31,158 @@ def test_env_isolation(fake_env, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "leak-me-not")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/somewhere.json")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "ambient-project")
-    env = build_env()
+    env = agy_backend.build_env()
     assert "GEMINI_API_KEY" not in env
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
     assert "GOOGLE_CLOUD_PROJECT" not in env
-    assert env["GEMINI_HOME"] == str(gemini_home())
+    assert env["GEMINI_HOME"] == str(agy_backend.gemini_home())
     assert env["AGY_ACP_FORCE_FILE_STORAGE"] == "1"
     assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "1"
 
 
 def test_argv_shape(fake_env):
-    argv = acp_argv()
-    joined = " ".join(argv)
+    argv = agy_backend.acp_argv()
     assert "acp" in argv
     assert "--gemini-dir" in argv
-    assert str(gemini_home()) in argv
-    assert "antigravity-acp" in joined
+    assert str(agy_backend.gemini_home()) in argv
 
 
-def test_initialize_auth_prompt_echo(fake_env, tmp_path):
-    updates = []
+def _start_session(tmp_path):
+    session = agy_backend.ChatSession("test-handle", str(tmp_path))
+    return session
 
+
+def test_session_start_prompt_streaming(fake_env, tmp_path):
     async def scenario():
-        client = HermesAcpClient(
-            on_update=lambda sid, update: updates.append(update),
-            on_permission=_deny_permission,
-        )
-        async with spawn_session(client, str(tmp_path)) as agent:
-            info = agent.initialize_response
-            assert info.agent_info.name == "Fake Antigravity ACP Server"
-            method_ids = [m.id for m in agent.auth_methods]
-            assert "oauth-personal" in method_ids
+        session = _start_session(tmp_path)
+        try:
+            await session.start()
+            assert session.agent_session_id == "fake-session-1"
+            assert session.meta["authenticated"] is True
 
-            await agent.authenticate("oauth-personal")
-            session = await agent.new_session(cwd=str(tmp_path))
-            sid = session.session_id
-            assert sid == "fake-session-1"
+            await session.prompt("hello antigravity")
+            # wait for the turn to finish
+            deadline = asyncio.get_running_loop().time() + 10
+            while session.turn_active and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
 
-            response = await agent.prompt(sid, "hello antigravity")
-            assert response.stop_reason == "end_turn"
-        return sid
+            text = "".join(e.get("text", "") for e in session.events if e["kind"] == "text")
+            assert "echo: hello antigravity" in text
+            kinds = [e["kind"] for e in session.events]
+            assert "ready" in kinds
+            assert "user" in kinds
+            assert "turn_end" in kinds
+        finally:
+            await session.close()
 
     run(scenario())
-    text = "".join(getattr(u.content, "text", "") for u in updates if hasattr(u, "content"))
-    assert "echo: hello antigravity" in text
 
 
-def test_permission_flow_selected(fake_env, tmp_path):
-    seen_options = []
-
-    async def allow_first(session_id, tool_call, options):
-        seen_options.extend(options)
-        return options[0].option_id
-
+def test_events_long_poll(fake_env, tmp_path):
     async def scenario():
-        updates = []
-        client = HermesAcpClient(
-            on_update=lambda sid, update: updates.append(update),
-            on_permission=allow_first,
-        )
-        async with spawn_session(client, str(tmp_path)) as agent:
-            await agent.authenticate("oauth-personal")
-            session = await agent.new_session(cwd=str(tmp_path))
-            response = await agent.prompt(session.session_id, "please permission-test this")
-            assert response.stop_reason == "end_turn"
-            return updates
+        session = _start_session(tmp_path)
+        try:
+            await session.start()
+            ready_events, next_seq = await session.events_since(0, wait=0)
+            assert any(e["kind"] == "ready" for e in ready_events)
 
-    updates = run(scenario())
-    assert len(seen_options) == 2
-    assert seen_options[0].name == "Allow once"
-    text = "".join(getattr(u.content, "text", "") for u in updates if hasattr(u, "content"))
-    assert "permission outcome: selected" in text
+            await session.prompt("stream test")
+            collected = []
+            deadline = asyncio.get_running_loop().time() + 10
+            since = next_seq
+            while asyncio.get_running_loop().time() < deadline:
+                fresh, since = await session.events_since(since, wait=1)
+                collected.extend(fresh)
+                if any(e["kind"] == "turn_end" for e in collected):
+                    break
+            text = "".join(e.get("text", "") for e in collected if e["kind"] == "text")
+            assert "echo: stream test" in text
+        finally:
+            await session.close()
+
+    run(scenario())
 
 
-def test_permission_flow_cancelled(fake_env, tmp_path):
+def test_permission_answer_selected(fake_env, tmp_path):
     async def scenario():
-        updates = []
-        client = HermesAcpClient(
-            on_update=lambda sid, update: updates.append(update),
-            on_permission=_deny_permission,
-        )
-        async with spawn_session(client, str(tmp_path)) as agent:
-            await agent.authenticate("oauth-personal")
-            session = await agent.new_session(cwd=str(tmp_path))
-            await agent.prompt(session.session_id, "permission-test")
-            return updates
+        session = _start_session(tmp_path)
+        try:
+            await session.start()
+            await session.prompt("please permission-test this")
 
-    updates = run(scenario())
-    text = "".join(getattr(u.content, "text", "") for u in updates if hasattr(u, "content"))
-    assert "permission outcome: cancelled" in text
+            # wait for the permission request to appear, then answer it
+            deadline = asyncio.get_running_loop().time() + 10
+            request_id = None
+            while asyncio.get_running_loop().time() < deadline:
+                for event in session.events:
+                    if event["kind"] == "permission_request":
+                        request_id = event["requestId"]
+                        break
+                if request_id:
+                    break
+                await asyncio.sleep(0.05)
+            assert request_id, "permission request never arrived"
+
+            assert session.answer_permission(request_id, "allow") is True
+
+            deadline = asyncio.get_running_loop().time() + 10
+            while session.turn_active and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+            text = "".join(e.get("text", "") for e in session.events if e["kind"] == "text")
+            assert "permission outcome: selected" in text
+        finally:
+            await session.close()
+
+    run(scenario())
 
 
-def test_register_only_cli_command():
+def test_permission_dismissed(fake_env, tmp_path):
+    async def scenario():
+        session = _start_session(tmp_path)
+        try:
+            await session.start()
+            await session.prompt("permission-test")
+            deadline = asyncio.get_running_loop().time() + 10
+            request_id = None
+            while asyncio.get_running_loop().time() < deadline:
+                for event in session.events:
+                    if event["kind"] == "permission_request":
+                        request_id = event["requestId"]
+                        break
+                if request_id:
+                    break
+                await asyncio.sleep(0.05)
+            assert request_id
+            assert session.answer_permission(request_id, None) is True
+            deadline = asyncio.get_running_loop().time() + 10
+            while session.turn_active and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
+            text = "".join(e.get("text", "") for e in session.events if e["kind"] == "text")
+            assert "permission outcome: cancelled" in text
+        finally:
+            await session.close()
+
+    run(scenario())
+
+
+def test_session_manager(fake_env, tmp_path):
+    async def scenario():
+        manager = agy_backend.SessionManager()
+        session = manager.create(str(tmp_path))
+        assert manager.get(session.handle) is session
+        try:
+            await session.start()
+        finally:
+            assert await manager.drop(session.handle) is True
+        assert manager.get(session.handle) is None
+        assert session.closed is True
+
+    run(scenario())
+
+
+def test_register_no_tools_no_hooks():
     import importlib.util
+
     spec = importlib.util.spec_from_file_location(
         "antigravity_acp_pkg",
         PLUGIN_ROOT / "__init__.py",
@@ -132,7 +191,7 @@ def test_register_only_cli_command():
     plugin = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(plugin)
 
-    calls = {"tools": 0, "hooks": 0, "cli": []}
+    calls = {"tools": 0, "hooks": 0, "cli": 0}
 
     class FakeCtx:
         def register_tool(self, **kwargs):
@@ -142,17 +201,11 @@ def test_register_only_cli_command():
             calls["hooks"] += 1
 
         def register_cli_command(self, name, **kwargs):
-            calls["cli"].append(name)
+            calls["cli"] += 1
 
         def register_command(self, *args, **kwargs):
             calls["hooks"] += 1
 
     plugin.register(FakeCtx())
-    assert calls["cli"] == ["antigravity"]
-    # Compliance invariant: no model tools, no automation hooks, ever.
-    assert calls["tools"] == 0
-    assert calls["hooks"] == 0
-
-
-async def _deny_permission(session_id, tool_call, options):
-    return None
+    # Compliance invariant: nothing the agent core or automation can invoke.
+    assert calls == {"tools": 0, "hooks": 0, "cli": 0}

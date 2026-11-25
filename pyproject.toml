@@ -1,14 +1,12 @@
 [project]
 name = "hermes-plugin-antigravity-acp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin interactive ACP client for Google Antigravity, as a Hermes Agent plugin"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "NightOnee" }]
 requires-python = ">=3.11"
-dependencies = [
-  "agent-client-protocol>=0.9,<1",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/NightOnee/hermes-plugin-antigravity-acp"

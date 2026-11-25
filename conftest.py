@@ -11,10 +11,5 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 collect_ignore = [
     "__init__.py",
-    "cli.py",
-    "client.py",
-    "process.py",
-    "repl.py",
-    "authflow.py",
     "tests/fake_agent.py",
 ]

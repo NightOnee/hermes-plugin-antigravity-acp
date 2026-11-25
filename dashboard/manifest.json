@@ -1,0 +1,8 @@
+{
+  "name": "antigravity-acp",
+  "label": "Antigravity ACP",
+  "description": "Backend for the native Desktop Antigravity chat page (interactive ACP client; no web dashboard tab of its own)",
+  "icon": "MessageSquare",
+  "version": "0.2.0",
+  "api": "plugin_api.py"
+}
