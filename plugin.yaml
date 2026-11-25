@@ -1,0 +1,24 @@
+name: antigravity-acp
+label: Antigravity ACP (Interactive)
+kind: standalone
+version: 0.1.0
+author: NightOnee
+homepage: https://github.com/NightOnee/hermes-plugin-antigravity-acp
+description: >
+  Thin interactive ACP client for Google Antigravity. `hermes antigravity chat`
+  opens a user-driven chat session with the official `agy acp` agent on your own
+  Google sign-in: you type prompts directly, Antigravity owns its agent loop,
+  history, tools and quota. This plugin deliberately registers no model provider,
+  no tools and no automation hooks - Hermes never generates prompts for it.
+requires_hermes: ">=0.21.4"
+provides_tools: []
+provides_hooks: []
+optional_env:
+  - name: ANTIGRAVITY_ACP_COMMAND
+    description: "Override the agy/antigravity executable (default: `agy` or `antigravity` on PATH)"
+    prompt: "Antigravity CLI command"
+    password: false
+  - name: ANTIGRAVITY_ACP_HOME
+    description: "Override the plugin's isolated profile directory (default: ~/.hermes/plugins-data/antigravity-acp)"
+    prompt: "Antigravity profile directory"
+    password: false
